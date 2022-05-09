@@ -1,0 +1,258 @@
+---
+title: "MATH615 Final Project - Sean Lowney"
+output: 
+  html_notebook: 
+    fig_caption: yes
+    number_sections: yes
+    theme: readable
+    toc: yes
+---
+
+---
+
+# . Introduction
+
+|  There are many factors that influence population health statistics, be it socioeconomic issues, i.e. access to quality healthcare or income levels, or more direct health considerations such as individual health behaviors or one's physical environment. A series of studies performed by the CDC in the 2010s suggest that there is a significant gap in the health standards between urban and rural U.S. citizens.^1^ With this in mind, the following study seeks to assess whether there are significant enough differences in the health behaviors of these populations to adequately predict a county's urban vs rural status based on data alone.
+
+|  To do this, I use a data set created by County Health Rankings, an organization under University of Wisconsin's School of Public Health whose purpose is to accumulate population health data for the sake of informed, data driven policy making. Their model divides the influences on health outcomes into four broad categories, of which I use those defined as health behaviors to generate a logistic regression model. The following notebook will include sections on loading and manipulating the data, a series of visualizations to better understand the data set, and finally model creation, tuning, and interpretation. If a difference between the two population exists, then I should be able to use this data to classify each county as rural or urban with greater than 75% accuracy.
+
+---
+
+# . R environment
+
+```{r}
+library(tidyverse)  #GGplot2, readr, tidyr
+library(dplyr)      #Dataframe manipulation
+library(readxl)     #Read in county class data
+library(ROCR)       #ROC/AUC plot
+library(ggpubr)     #ggboxplot
+
+#Packages not loaded but used directly: Hmisc, broom, car
+```
+
+---
+
+# . Data preparation
+
+## . Data description
+
+This analysis uses two data sets. \
+1) National Center for Health Statistics: Urban-Rural Classification Scheme for Counties - Based on Office of Management and Budget's of metro- and micropolitan statistical areas.^2^\
+2) County Health Rankings: 2020 county level health statistics - selected for statistics relating to actions individuals take that affect their health.^3^
+
+## . Data loading and manipulation
+
+The data loading and manipulation is documented as such. County classification data and health statistics are loaded, adjusted for proper data typing, and joined based on the FIPS-code, a unique county identifier. Raw values were selected and renamed for easier understanding. I then filter out columns in which more than 100 rows are NA, then remove the remaining rows with NA values and finally remove the FIPS column as it is no longer needed. This leaves me with a dataframe containing 10 features, 1 target classification value, and 3028 sample counties. 
+
+```{r}
+#1: Load and process counties by urban-rural classification scheme
+countyClass = select(read_excel("../data/countycodes.xlsx"),c('FIPS code','2013 code')) %>% 
+  rename(FIPS = 'FIPS code',Class = '2013 code') %>% 
+  mutate(classAdj = ifelse(Class <=4, "Urban","Rural"))
+
+countyClass$FIPS = as.integer(countyClass$FIPS)
+countyClass$classAdj = as.factor(countyClass$classAdj)
+
+#2: Create vectors to select and rename target features, load data
+featureSelect = c('fipscode','v009_rawvalue','v011_rawvalue','v133_rawvalue','v070_rawvalue',
+                   'v132_rawvalue','v049_rawvalue','v134_rawvalue','v045_rawvalue','v139_rawvalue',
+                   'v083_rawvalue','v138_rawvalue','v039_rawvalue','v147_rawvalue')
+ 
+featureNames = c('FIPS','Smoking','Obesity','Food_Envi','Phys_Inactivity','Exercise_Opp',
+                  'Drinking','DUI_Death','STI','Food_Insecutrity',
+                  'Healthy_Food_Access','Drug_Overdose','Motor_Vehicle_Death','Life_Expectancy')
+
+rawStats = select(read.csv("../data/socEcData2020.csv"),contains(featureSelect)) %>% filter(fipscode != 0)
+colnames(rawStats) = featureNames
+
+#3: Join county classification with other tables
+joinData = rawStats %>% left_join(select(countyClass,c("FIPS","classAdj")))
+
+#4: Tidy the joined tables
+tidyData = drop_na(joinData[ , colSums(is.na(rawStats)) < 100]) %>% select(-FIPS)
+cat("Dataframe dimensions -- Before: ",dim(joinData)," -- After: ",dim(tidyData))
+cat("\nNAs -- Before: ",sapply(joinData,function(x) sum(is.na(x)))," -- After: ",sapply(tidyData,function(x) sum(is.na(x))))
+
+#Preview
+head(tidyData)
+```
+
+---
+
+# . Data visualization 
+
+One of the more general health defining statistics of an area is its average life expectancy. In the following block, I seek to characterize the difference in this measure for the two populations. The data is split based on classification and tested to see whether the difference in means is significant. The null hypothesis, that no difference exists between the two populations, would suggest that further exploration into these statistics are potentially unnecessary. First, an F test to compare variances is performed and passed into the T test. 
+
+```{r}
+#Exploratory statistics
+group_by(tidyData,classAdj) %>%
+  summarise(
+    count = n(),
+    mean = mean(Life_Expectancy),
+    sd = sd(Life_Expectancy)
+  )
+#Exploratory statistics
+ggboxplot(tidyData, x = "classAdj", y = "Life_Expectancy", 
+          color = "classAdj", palette = c("#00AFBB", "#E7B800"),
+        ylab = "Life_Expectancy", xlab = "Classification")
+#Variance and T tests
+var.test(Life_Expectancy ~ classAdj, data = tidyData) #Returns significant p-value showing that variance is not equal
+
+t.test(Life_Expectancy ~ classAdj, data = tidyData, var.equal = FALSE)
+```
+
+As a result of the above T test, I can reject the null hypothesis and assume that a difference in means exists between the two populations. I will now visualize some of the other data to understand the distributions. First, I used the Hmisc package to view the distribution of the whole data set. I then use GGPlot to split the data based on classification to see if there are any differences between the way certain variables are distributed among different populations. 
+
+```{r}
+Hmisc::hist.data.frame(tidyData)
+ggplot(tidyData,aes(x=Life_Expectancy))+
+  geom_histogram(bins=50)+
+  facet_grid(~classAdj)+
+  theme_bw()
+ggplot(tidyData,aes(x=Exercise_Opp))+
+  geom_histogram(bins=50)+
+  facet_grid(~classAdj)+
+  theme_bw()
+ggplot(tidyData,aes(x=Healthy_Food_Access))+
+  geom_histogram(bins=50)+
+  facet_grid(~classAdj)+
+  theme_bw()
+```
+I can see from the above histograms that the data appears mostly normal with several features displaying a skew to one direction. On further analysis, this skew appears consistent for both urban and rural populations and so I will continue my analysis cognizant of this fact. 
+
+---
+
+# . Data modeling
+
+## . Model description
+
+I will now attempt to create the classification model. To do this, I will use a binomial logistic regression to predict between urban and rural classification. 
+
+## . Model
+
+
+
+```{r}
+#Logistic Reg
+logitModel = glm(classAdj~.,data=tidyData,family="binomial")
+summary(logitModel)
+```
+
+
+## . Diagnostics
+
+Before proceeding further, I need to ensure that several assumptions associated with logistic regression models are consistent with this model. The three I will test for are the existence of linearity and the lack of influential values and multicollinearity.^4^
+
+```{r}
+#Create test prediction model for diagnostic purposes
+testPrediction =  predict(logitModel, type = "response")
+
+#Select predictors
+testData = tidyData %>% select_if(is.numeric) 
+predictors = colnames(mydata)
+
+#Plotting
+testData = testData %>%
+  mutate(logit = log(testPrediction/(1-testPrediction))) %>%
+  gather(key = "predictors", value = "Predictor Value", -logit)
+
+ggplot(testData, aes(logit, `Predictor Value`))+
+  geom_point(size = 0.5, alpha = 0.5) +
+  geom_smooth(method = "loess") + 
+  theme_bw() + 
+  facet_wrap(~predictors, scales = "free_y")
+```
+
+The linearity assumption holds well enough for most of the predictor variables. Certain predictors, like physical inactivity, are questionable, however the tails that interrupt the nonlinear assumptions are the result of notably fewer samples so I am willing to ignore them in this case.
+
+```{r}
+#Compute scaled residuals
+influentialData = broom::augment(logitModel) %>% 
+  mutate(index = 1:n()) 
+
+#Plotting
+ggplot(influentialData, aes(index, .std.resid)) + 
+  geom_point(aes(color = classAdj), alpha = .5) +
+  theme_bw()
+#Check for influential data points
+badSamples = influentialData %>% filter(abs(.std.resid) > 3) %>% nrow()
+print(paste("Number of overly influential samples:",badSamples))
+```
+Data points with scaled residuals above 3 are considered possible outliers. The above analysis suggests that no such samples exists and so the assumption of no overly influential samples holds.
+
+```{r}
+#Test for overly correlated predictors
+car::vif(logitModel)
+```
+By calculating the variance inflation factor, I can estimate the severity of multicollinearity among the features. Values above 5 are concerning, three of which are seen above. These three features are all food related, so a correlation between them is understandable. Of the three, food insecurity was the most confidently linear predictor, so I will remove the other two and retest. 
+
+```{r}
+#Remove feature
+tidyData2 = select(tidyData,-one_of(c("Food_Envi","Healthy_Food_Access")))
+
+#Recreate model
+logitModel2 = glm(classAdj~.,data=tidyData2,family="binomial")
+
+#Rerun test for multicollinearity
+car::vif(logitModel2)
+
+```
+Much better! 
+
+--- 
+
+# . Results 
+
+## . Model interpretation 
+
+I will now run and test the accuracy of the model. First, I will split the data into training and test set. Then I will run an ANOVA test to compare it to the null model, test the prediction accuracy on the test set.
+
+```{r}
+#Train/Test Split
+numSamples = nrow(tidyData2)
+train = tidyData2[1:round(0.8*numSamples),]
+test = tidyData2[(numSamples-0.2*numSamples+1):numSamples,]
+
+#Run Model
+finalModel = glm(classAdj~.,data=train,family="binomial")
+
+#ANOVA
+anova(finalModel, test="Chisq")
+
+#Prediction Accuracy
+results = predict(finalModel,test,type='response')
+results = ifelse(results > 0.5,"Urban","Rural")
+
+error = mean(results != test$classAdj)
+print(paste('Accuracy: ',round(1-error,4)*100,'%',sep=""))
+
+```
+
+## . Model visualization
+
+Because visualizing a logistic regression model with several predictor variables isn't very viable, I've chosen to show it as the ROC plot. Here I ROC plot as a function of true and false positive rates. An AUC of closer to 1 is ideal. 
+
+```{r}
+#Predict and plot AUC curve
+pred = predict(finalModel, test, type="response")
+testPred = prediction(pred, test$classAdj)
+rocPlot = performance(testPred, measure = "tpr", x.measure = "fpr")
+plot(rocPlot)
+#Calc area under curve
+auc = performance(pr, measure = "auc")
+auc = auc@y.values[[1]]
+auc
+```
+
+---
+
+# . Discussion and conclusion
+
+Unfortunately, this model was not able to obtain the predictive ability I was aiming for. Although the accuracy, was around 65%, which suggest some measure of predictability given the factors I used, such a model can not be used reliably. This suggests one of two things: either that the differences between urban and rural populations are not differentiable, or that the predictors used in this analysis were not sufficient to differentiate. Given that several predictors were shown to be statistically different between the two populations, I am inclined to consider the ladder as the more likely reason and would be interested to see whether being more selective/specific in choosing additional predictors would produce a more robust model. 
+
+# . References
+
+1) https://www.cdc.gov/ruralhealth/about.html#:~:text=A%20series%20of%20studies%20from,stroke%20than%20their%20urban%20counterparts.
+2) https://www.cdc.gov/nchs/data_access/urban_rural.htm
+3) https://www.countyhealthrankings.org/explore-health-rankings/measures-data-sources/county-health-rankings-model/health-factors/health-behaviors
+4) http://www.sthda.com/english/articles/36-classification-methods-essentials/148-logistic-regression-assumptions-and-diagnostics-in-r/
